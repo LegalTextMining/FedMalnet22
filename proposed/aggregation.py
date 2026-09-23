@@ -1,32 +1,62 @@
-from flwr.server.strategy import FedAvg
+from typing import Dict, List, Optional, Tuple
 
-"""
-Strategy Flower kustom: agregasi berbasis cosine distance ke theta global,
-bukan berbasis num_examples (FedAvg standar).
-
-Client dengan theta yang cosine-similarity-nya lebih tinggi ke theta global
-ronde sebelumnya akan mendapat bobot agregasi lebih besar.
-"""
-
-from typing import List, Tuple, Optional, Dict
 import numpy as np
+
 from flwr.common import (
-    FitRes, Parameters, Scalar, ndarrays_to_parameters, parameters_to_ndarrays,
+    FitRes,
+    Parameters,
+    Scalar,
+    ndarrays_to_parameters,
+    parameters_to_ndarrays,
 )
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 
 
+# ============================================================
+# Utility Functions
+# ============================================================
+
+def _flatten(ndarrays: List[np.ndarray]) -> np.ndarray:
+    """Flatten seluruh parameter model menjadi satu vektor."""
+    return np.concatenate([np.asarray(param).flatten() for param in ndarrays])
+
+
+def cosine_similarity(
+    a: np.ndarray,
+    b: np.ndarray,
+    eps: float = 1e-8,
+) -> float:
+    """
+    Menghitung cosine similarity antara dua vektor.
+
+    Returns:
+        Nilai cosine similarity dalam range [-1, 1].
+    """
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+
+    if norm_a < eps or norm_b < eps:
+        return 0.0
+
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# ============================================================
+# Standard FedAvg Strategy
+# ============================================================
 
 def build_fedavg_strategy(
-    num_clients,
-    init_params,
+    num_clients: int,
+    init_params: Parameters,
     evaluate_fn,
     fit_metrics_agg,
     fraction_fit: float = 1.0,
     fraction_evaluate: float = 0.0,
-):
-    """Buat strategy FedAvg dengan konfigurasi standar untuk simulasi ini."""
+) -> FedAvg:
+    """
+    Membuat strategy FedAvg standar Flower.
+    """
     return FedAvg(
         fraction_fit=fraction_fit,
         fraction_evaluate=fraction_evaluate,
@@ -37,8 +67,44 @@ def build_fedavg_strategy(
         fit_metrics_aggregation_fn=fit_metrics_agg,
     )
 
-def build_fedcosine_strategy(num_clients, init_params, evaluate_fn,
-                              fit_metrics_agg, temperature=0.1, min_weight=0.0):
+
+# ============================================================
+# FedCosine Strategy Builder
+# ============================================================
+
+def build_fedcosine_strategy(
+    num_clients: int,
+    init_params: Parameters,
+    evaluate_fn,
+    fit_metrics_agg,
+    temperature: float = 0.1,
+    min_weight: float = 0.0,
+) -> "FedCosine":
+    """
+    Membuat strategy FedCosine.
+
+    Args:
+        num_clients:
+            Jumlah client yang digunakan dalam federated learning.
+
+        init_params:
+            Parameter awal model global.
+
+        evaluate_fn:
+            Fungsi evaluasi model global.
+
+        fit_metrics_agg:
+            Fungsi agregasi metrics dari client.
+
+        temperature:
+            Mengontrol ketajaman softmax.
+            Nilai kecil -> client dengan similarity tinggi
+            mendapat bobot lebih besar.
+
+        min_weight:
+            Bobot minimum untuk setiap client.
+            Nilai 0 berarti tidak ada batas minimum.
+    """
     return FedCosine(
         temperature=temperature,
         min_weight=min_weight,
@@ -51,39 +117,62 @@ def build_fedcosine_strategy(num_clients, init_params, evaluate_fn,
         fit_metrics_aggregation_fn=fit_metrics_agg,
     )
 
-# def build_distanceAG_strategy(
-        
-# ):
-def _flatten(ndarrays: List[np.ndarray]) -> np.ndarray:
-    return np.concatenate([np.asarray(p).flatten() for p in ndarrays])
 
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na < eps or nb < eps:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
+# ============================================================
+# FedCosine Strategy
+# ============================================================
 
 class FedCosine(FedAvg):
     """
-    FedAvg, tapi bobot agregasi per client = softmax(cosine_similarity ke theta
-    global ronde sebelumnya), bukan proporsional num_examples.
+    Custom FedAvg dengan pembobotan berdasarkan cosine similarity.
 
-    temperature: mengatur seberapa 'tajam' perbedaan bobot antar client.
-        - temperature kecil (mis. 0.05) -> perbedaan bobot makin ekstrem
-          (client paling mirip global mendominasi).
-        - temperature besar (mis. 1.0)  -> bobot makin merata (mendekati rata2 biasa).
-    min_weight: batas bawah bobot supaya client yang menyimpang tidak dapat
-        bobot 0 total (opsional, untuk stabilitas / fairness).
+    Berbeda dengan FedAvg standar yang menggunakan `num_examples`
+    sebagai dasar bobot agregasi, FedCosine menentukan bobot client
+    berdasarkan cosine similarity antara parameter model client dan
+    parameter model global pada ronde sebelumnya.
+
+    Mekanisme:
+
+        1. Ambil parameter model dari setiap client.
+        2. Hitung cosine similarity terhadap model global sebelumnya.
+        3. Ubah similarity menjadi bobot menggunakan softmax.
+        4. Lakukan weighted average pada setiap layer.
+        5. Gunakan hasil agregasi sebagai model global berikutnya.
+
+    Args:
+        temperature:
+            Mengontrol seberapa tajam perbedaan bobot antar client.
+
+            - kecil, misalnya 0.05:
+              client dengan similarity tinggi lebih dominan.
+
+            - besar, misalnya 1.0:
+              bobot antar client menjadi lebih merata.
+
+        min_weight:
+            Bobot minimum untuk setiap client.
+            Berguna untuk mencegah client tertentu mendapatkan
+            bobot terlalu kecil.
     """
 
-    def __init__(self, *args, temperature: float = 0.1,
-                 min_weight: float = 0.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        temperature: float = 0.1,
+        min_weight: float = 0.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+
         self.temperature = temperature
         self.min_weight = min_weight
-        self._prev_global_flat: Optional[np.ndarray] = None  # theta global ronde sblmnya
+
+        # Parameter global dari ronde sebelumnya.
+        self._prev_global_flat: Optional[np.ndarray] = None
+
+    # --------------------------------------------------------
+    # Aggregate Fit
+    # --------------------------------------------------------
 
     def aggregate_fit(
         self,
@@ -91,66 +180,174 @@ class FedCosine(FedAvg):
         results: List[Tuple[ClientProxy, FitRes]],
         failures,
     ):
+        """
+        Mengagregasi hasil training dari client menggunakan
+        cosine similarity sebagai bobot.
+        """
+
+        # ----------------------------------------------------
+        # 1. Validasi hasil client
+        # ----------------------------------------------------
+
         if not results:
             return None, {}
 
-        # ambil theta tiap client (ndarrays) + metrics
+        # ----------------------------------------------------
+        # 2. Ambil parameter dari setiap client
+        # ----------------------------------------------------
+
         client_thetas: List[np.ndarray] = []
         client_ndarrays: List[List[np.ndarray]] = []
+
         for _, fit_res in results:
-            nds = parameters_to_ndarrays(fit_res.parameters)
-            client_ndarrays.append(nds)
-            client_thetas.append(_flatten(nds))
+            ndarrays = parameters_to_ndarrays(fit_res.parameters)
 
-        # referensi: theta global ronde sebelumnya. Kalau belum ada (ronde 1),
-        # pakai rata-rata theta client ronde ini sebagai referensi sementara.
+            client_ndarrays.append(ndarrays)
+            client_thetas.append(_flatten(ndarrays))
+
+        # ----------------------------------------------------
+        # 3. Tentukan reference model
+        # ----------------------------------------------------
+        #
+        # Ronde pertama:
+        #   belum ada global model sebelumnya, sehingga
+        #   digunakan rata-rata parameter client sebagai
+        #   reference sementara.
+        #
+        # Ronde berikutnya:
+        #   gunakan global model dari ronde sebelumnya.
+        # ----------------------------------------------------
+
         if self._prev_global_flat is None:
-            ref = np.mean(np.stack(client_thetas, axis=0), axis=0)
-        else:
-            ref = self._prev_global_flat
-
-        # hitung cosine similarity tiap client ke referensi
-        sims = np.array([cosine_similarity(t, ref) for t in client_thetas])
-
-        # ubah similarity jadi bobot lewat softmax (biar semua positif & jumlah=1)
-        # similarity range [-1, 1] -> dibagi temperature lalu softmax
-        scaled = sims / max(self.temperature, 1e-6)
-        scaled = scaled - scaled.max()  # stabilitas numerik
-        weights = np.exp(scaled)
-        weights = weights / weights.sum()
-
-        # opsional: pasang batas bawah bobot, lalu renormalisasi
-        if self.min_weight > 0:
-            weights = np.maximum(weights, self.min_weight)
-            weights = weights / weights.sum()
-
-        # weighted average per layer (bukan pakai num_examples seperti FedAvg asli)
-        n_layers = len(client_ndarrays[0])
-        agg_ndarrays = []
-        for layer_idx in range(n_layers):
-            layer_stack = np.stack(
-                [client_ndarrays[i][layer_idx] for i in range(len(client_ndarrays))],
+            reference = np.mean(
+                np.stack(client_thetas, axis=0),
                 axis=0,
             )
-            w = weights.reshape([-1] + [1] * (layer_stack.ndim - 1))
-            agg_layer = np.sum(layer_stack * w, axis=0)
-            agg_ndarrays.append(agg_layer.astype(client_ndarrays[0][layer_idx].dtype))
+        else:
+            reference = self._prev_global_flat
 
-        # simpan sebagai referensi untuk ronde berikutnya
-        self._prev_global_flat = _flatten(agg_ndarrays)
+        # ----------------------------------------------------
+        # 4. Hitung cosine similarity
+        # ----------------------------------------------------
 
-        aggregated_params = ndarrays_to_parameters(agg_ndarrays)
+        similarities = np.array(
+            [
+                cosine_similarity(theta, reference)
+                for theta in client_thetas
+            ]
+        )
 
-        # metrics tambahan biar bisa dipantau: bobot & similarity tiap client
-        metrics_aggregated: Dict[str, Scalar] = {}
+        # ----------------------------------------------------
+        # 5. Konversi similarity menjadi aggregation weights
+        # ----------------------------------------------------
+
+        temperature = max(self.temperature, 1e-6)
+
+        scaled_similarity = similarities / temperature
+
+        # Numerical stability untuk softmax
+        scaled_similarity -= scaled_similarity.max()
+
+        weights = np.exp(scaled_similarity)
+        weights /= weights.sum()
+
+        # ----------------------------------------------------
+        # 6. Terapkan minimum weight jika diperlukan
+        # ----------------------------------------------------
+
+        if self.min_weight > 0.0:
+            weights = np.maximum(
+                weights,
+                self.min_weight,
+            )
+
+            # Normalisasi ulang agar total bobot = 1
+            weights /= weights.sum()
+
+        # ----------------------------------------------------
+        # 7. Weighted aggregation setiap layer
+        # ----------------------------------------------------
+
+        num_layers = len(client_ndarrays[0])
+
+        aggregated_ndarrays: List[np.ndarray] = []
+
+        for layer_idx in range(num_layers):
+
+            layer_stack = np.stack(
+                [
+                    client_ndarrays[client_idx][layer_idx]
+                    for client_idx in range(len(client_ndarrays))
+                ],
+                axis=0,
+            )
+
+            # Ubah shape weights agar broadcasting sesuai
+            weight_shape = [-1] + [1] * (layer_stack.ndim - 1)
+
+            reshaped_weights = weights.reshape(weight_shape)
+
+            aggregated_layer = np.sum(
+                layer_stack * reshaped_weights,
+                axis=0,
+            )
+
+            # Pertahankan dtype parameter client
+            aggregated_layer = aggregated_layer.astype(
+                client_ndarrays[0][layer_idx].dtype
+            )
+
+            aggregated_ndarrays.append(aggregated_layer)
+
+        # ----------------------------------------------------
+        # 8. Simpan global model untuk ronde berikutnya
+        # ----------------------------------------------------
+
+        self._prev_global_flat = _flatten(
+            aggregated_ndarrays
+        )
+
+        aggregated_parameters = ndarrays_to_parameters(
+            aggregated_ndarrays
+        )
+
+        # ----------------------------------------------------
+        # 9. Aggregate metrics
+        # ----------------------------------------------------
+
+        aggregated_metrics: Dict[str, Scalar] = {}
+
         if self.fit_metrics_aggregation_fn is not None:
-            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
-            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+            fit_metrics = [
+                (fit_res.num_examples, fit_res.metrics)
+                for _, fit_res in results
+            ]
 
-        # tempel info cosine ke metrics (opsional, buat tracking/report)
-        for i, (client_proxy, fit_res) in enumerate(results):
-            cname = fit_res.metrics.get("client_name", f"client_{i}")
-            metrics_aggregated[f"cos_sim_{cname}"] = float(sims[i])
-            metrics_aggregated[f"agg_weight_{cname}"] = float(weights[i])
+            aggregated_metrics = (
+                self.fit_metrics_aggregation_fn(fit_metrics)
+            )
 
-        return aggregated_params, metrics_aggregated
+        # ----------------------------------------------------
+        # 10. Tambahkan cosine similarity & aggregation weight
+        # ----------------------------------------------------
+
+        for idx, (_, fit_res) in enumerate(results):
+
+            client_name = fit_res.metrics.get(
+                "client_name",
+                f"client_{idx}",
+            )
+
+            aggregated_metrics[
+                f"cos_sim_{client_name}"
+            ] = float(similarities[idx])
+
+            aggregated_metrics[
+                f"agg_weight_{client_name}"
+            ] = float(weights[idx])
+
+        # ----------------------------------------------------
+        # 11. Return hasil agregasi
+        # ----------------------------------------------------
+
+        return aggregated_parameters, aggregated_metrics
