@@ -75,3 +75,4 @@ if __name__ == "__main__":
     example_in_dim = 100  # ganti sesuai jumlah fitur dataset Anda
     model = build_model(in_dim=example_in_dim)
     print(model)
+
