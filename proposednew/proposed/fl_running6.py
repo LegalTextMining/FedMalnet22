@@ -236,7 +236,8 @@ class FlowerClient(NumPyClient):
 
 import csv
 # from aggregation import build_fedavg_strategy
-from aggregationsimilarity import build_fedcosine_pairwise_strategy
+# from aggregationsimilarity import build_fedcosine_pairwise_strategy
+from aggregation4 import build_fedcosine_pairwise_strategy
 
 # -----------------------------------------------------------------------------
 # Runner
@@ -323,11 +324,11 @@ def run_federated(
     num_clients=num_clients,
     init_params=init_params,
     evaluate_fn=evaluate_fn,
-    fit_metrics_agg=weighted_average,
-    temperature=0.05,
+    fit_metrics_agg=fit_metrics_agg,
+    temperature=0.1,
     min_weight=0.0,
-    similarity_agg="mean",          # atau "median"
-    combine_mode="similarity_only", # jumlah data diabaikan total
+    similarity_agg="mean",
+    data_influence=0.2,   # 20% pengaruh jumlah data, 80% similarity tetap dominan
 )
         return ServerAppComponents(
             strategy=strategy, config=ServerConfig(num_rounds=num_rounds))

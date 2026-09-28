@@ -1,6 +1,31 @@
 """
-fl_runner.py
+Simulasi Federated Learning (Flower) untuk klasifikasi malware Android.
+Varian PERSONALIZED (FedPer) dengan dukungan CLIENT HETEROGEN FITUR:
+tiap client (mis. Drebin, KronoDroid, MalGenome, TUANDROMD) boleh punya
+jumlah fitur mentah yang berbeda.
+
+Arsitektur per client:
+    raw_features (n_features_client, beda2 per client)
+        -> Adapter (Linear, LOKAL, tidak pernah dikirim)
+    common_dim (SAMA untuk semua client)
+        -> theta / FeatureExtractor (DIBAGI & diagregasi di server)
+        -> phi   / ClassifierHead   (LOKAL, tidak pernah dikirim)
+    logits
+
+Hanya `theta` yang dipertukarkan client<->server. `adapter` dan `phi`
+disimpan lokal per client (persisten antar ronde lewat file sementara),
+sama seperti pendekatan FedPer standar.
+
+Karena tiap client adalah dataset yang berbeda (bukan partisi dari satu
+dataset yang sama), evaluasi (val & test) dilakukan PER CLIENT memakai
+data miliknya sendiri, lalu dirata-rata untuk ringkasan.
+
+Bandwidth dihitung dari ukuran payload theta saja (nbytes array numpy).
+
+TAMBAHAN: tracking THETA PER CLIENT tiap ronde (statistik ringkas +
+opsional jarak L2 ke theta global) lewat theta_log & print_theta_report().
 """
+
 import os
 import shutil
 import tempfile
@@ -8,7 +33,6 @@ from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import numpy as np
-from sklearn import metrics
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -19,9 +43,10 @@ from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays, Context,
 from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.server.strategy import FedAvg
 from flwr.simulation import run_simulation
+
 from model import build_model
 
-DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MB = 1024 ** 2
 METRIC_KEYS = ("accuracy", "precision", "recall", "f1")
@@ -188,6 +213,75 @@ def evaluate_personalized_per_client(
 
 
 # -----------------------------------------------------------------------------
+# Inspeksi theta per client (statistik ringkas, hemat memori)
+# -----------------------------------------------------------------------------
+def summarize_theta(theta: NDArrays) -> Dict:
+    """Ringkasan statistik satu theta (list of numpy array per layer)."""
+    flat = np.concatenate([np.asarray(p).flatten() for p in theta])
+    return {
+        "n_params": int(flat.size),
+        "mean": float(flat.mean()),
+        "std": float(flat.std()),
+        "norm": float(np.linalg.norm(flat)),
+        "min": float(flat.min()),
+        "max": float(flat.max()),
+    }
+
+
+def theta_diff_from_global(theta_client: NDArrays, theta_global: NDArrays) -> float:
+    """
+    L2 distance total antara theta client vs theta global (seberapa 'menyimpang').
+    Butuh array theta MENTAH kedua sisi (bukan cuma statistik ringkas).
+    Karena client jalan di process terpisah (Ray), theta mentah client tidak
+    otomatis tersedia di notebook -- fungsi ini disediakan untuk kasus kamu
+    punya theta mentah dari sumber lain (mis. simpan manual di evaluate_fn,
+    yang jalan di server/process utama dan MEMANG punya akses ke theta client
+    lewat evaluate_personalized_per_client).
+    """
+    diffs = [np.linalg.norm(np.asarray(pc) - np.asarray(pg))
+             for pc, pg in zip(theta_client, theta_global)]
+    return float(np.sqrt(sum(d ** 2 for d in diffs)))
+
+
+def approx_theta_gap(stats_client: Dict, stats_global: Dict) -> float:
+    """
+    Perkiraan kasar seberapa 'jauh' theta client dari theta global, HANYA dari
+    statistik ringkas (norm & mean), tanpa perlu array mentah. Bukan jarak L2
+    yang presisi, tapi cukup untuk melihat tren/anomali antar client.
+    """
+    return float(abs(stats_client["norm"] - stats_global["norm"]))
+
+
+def print_theta_report(theta_log: Dict[str, list]) -> None:
+    """
+    Cetak ringkasan statistik theta tiap client, tiap ronde.
+
+    theta_log: {nama_client: [{"round": r, "stats": {...}}, ...]}
+        (diisi otomatis oleh run_federated lewat metrics fit(), aman lintas-process)
+    """
+    print("\n=== LAPORAN THETA PER CLIENT ===")
+    for cname, entries in theta_log.items():
+        print(f"\n[{cname}]")
+        for e in entries:
+            r, stats = e["round"], e["stats"]
+            print(f"  round {r:02d} | n_params={stats['n_params']} "
+                  f"mean={stats['mean']:.5f} std={stats['std']:.5f} "
+                  f"norm={stats['norm']:.4f} min={stats['min']:.4f} max={stats['max']:.4f}")
+
+
+def theta_report_to_rows(theta_log: Dict[str, list]) -> List[Dict]:
+    """
+    Ubah theta_log jadi list of dict rata (cocok untuk pandas.DataFrame atau CSV),
+    kolom: client, round, n_params, mean, std, norm, min, max.
+    """
+    rows = []
+    for cname, entries in theta_log.items():
+        for e in entries:
+            row = {"client": cname, "round": e["round"], **e["stats"]}
+            rows.append(row)
+    return rows
+
+# -----------------------------------------------------------------------------
 # Client
 # -----------------------------------------------------------------------------
 class FlowerClient(NumPyClient):
@@ -223,10 +317,29 @@ class FlowerClient(NumPyClient):
 
         new_params = get_theta_params(self.model)          # hanya theta dikirim
         bytes_up = params_nbytes(new_params)
-        return new_params, len(self.X), {
+
+        # statistik theta SESUDAH training lokal (sebelum dikirim ke server utk agregasi)
+        # PENTING: run_simulation menjalankan tiap client di process/actor Ray
+        # terpisah dari notebook utama. Dict biasa yang di-capture lewat closure
+        # (mis. theta_log) TIDAK ikut ter-update di process utama. Satu-satunya
+        # cara data balik ke server/notebook adalah lewat return value fit()
+        # (parameters, num_examples, metrics) -- sama seperti bytes_up/bytes_down.
+        stats_after = summarize_theta(new_params)
+
+        metrics = {
             "bytes_down": float(bytes_down),
             "bytes_up": float(bytes_up),
+            "client_name": self.name,
+
+            # theta SESUDAH training lokal (sebelum diagregasi server)
+            "theta_mean": stats_after["mean"],
+            "theta_std": stats_after["std"],
+            "theta_norm": stats_after["norm"],
+            "theta_min": stats_after["min"],
+            "theta_max": stats_after["max"],
+            "theta_n_params": stats_after["n_params"],
         }
+        return new_params, len(self.X), metrics
 
     def evaluate(self, parameters, config):
         set_theta_params(self.model, parameters)
@@ -234,9 +347,10 @@ class FlowerClient(NumPyClient):
         loss, m = evaluate_model(self.model, self.X, self.y)
         return loss, len(self.X), m
 
-import csv
-# from aggregation import build_fedavg_strategy
-from aggregationsimilarity import build_fedcosine_pairwise_strategy
+
+# from aggregation import build_fedavg_strategy, build_fedcosine_strategy, build_fedcosine_pairwise_strategy
+
+from aggregation2 import build_fedcosine_pairwise_strategy
 
 # -----------------------------------------------------------------------------
 # Runner
@@ -252,6 +366,37 @@ def run_federated(
     batch_size: int = 64,
     lr: float = 1e-3,
 ) -> Dict:
+    """
+    Jalankan satu skenario FL (hanya theta yang diagregasi), untuk client
+    dengan jumlah fitur berbeda-beda.
+
+    fed_data: dict {nama_client: {
+        "X_train", "y_train",            # wajib
+        "X_val", "y_val",                # opsional, untuk history per ronde
+        "X_test", "y_test",              # opsional, untuk evaluasi akhir
+        "n_features": int,               # wajib, jumlah fitur mentah client ini
+    }}
+
+    common_dim: dimensi bersama tempat `theta` beroperasi. Harus sama untuk
+        semua client (mis. 128). Adapter linear lokal memetakan fitur mentah
+        tiap client ke common_dim ini.
+
+    History per ronde: round, loss, accuracy, precision, recall, f1
+      -> RATA-RATA dari seluruh client (dievaluasi pada data validasi
+         miliknya masing-masing, dengan theta global + adapter/phi lokal).
+    history["val_per_client"]  : dict {nama_client: metrics} tiap ronde (list)
+    history["test"]            : rata-rata metrik test (theta ronde terakhir)
+    history["test_per_client"] : metrik test per client
+    history["theta_log"]       : {nama_client: [{"round","stats"}, ...]}
+        Statistik ringkas theta tiap client tiap ronde (mean/std/norm/min/max),
+        dikumpulkan lewat metrics fit() -- aman lintas-process (Ray).
+    history["global_theta_per_round"] : {round: theta_global_ndarrays}
+        Dipakai untuk hitung jarak (L2) theta tiap client ke theta global,
+        lewat theta_diff_from_global(). Bisa dipanggil manual pakai
+        history["theta_log"] (stats) vs simpan sendiri theta client kalau perlu
+        array mentah -- lihat catatan di bawah fungsi ini.
+    Bandwidth: bytes_up, bytes_down, bytes_total, cum_mb, comm (ringkasan).
+    """
     for cname, c in fed_data.items():
         if "n_features" not in c:
             raise KeyError(f"fed_data['{cname}'] harus punya key 'n_features'.")
@@ -266,6 +411,12 @@ def run_federated(
                       "val_per_client"]}
     last = {"params": None}
 
+    # struktur untuk tracking theta per client & theta global per ronde
+    # (diisi dari fit_metrics_agg / evaluate_fn, yang jalan di process utama)
+    theta_log: Dict[str, list] = {}
+    global_theta_per_round: Dict[int, NDArrays] = {}
+    round_counter = {"n": 0}  # fit_metrics_agg tidak dapat server_round langsung
+
     def client_fn(context: Context) -> Client:
         cid = int(context.node_config["partition-id"])
         cname = client_names[cid]
@@ -277,6 +428,7 @@ def run_federated(
         ).to_client()
 
     def fit_metrics_agg(results):
+        # results: List[Tuple[num_examples, metrics_dict]] (per client, ronde ini)
         up = sum(m.get("bytes_up", 0.0) for _, m in results)
         down = sum(m.get("bytes_down", 0.0) for _, m in results)
         prev = history["cum_mb"][-1] if history["cum_mb"] else 0.0
@@ -284,6 +436,26 @@ def run_federated(
         history["bytes_down"].append(down)
         history["bytes_total"].append(up + down)
         history["cum_mb"].append(prev + (up + down) / MB)
+
+        # kumpulkan statistik theta tiap client untuk ronde ini
+        round_counter["n"] += 1
+        r = round_counter["n"]
+        for _, m in results:
+            cname = m.get("client_name")
+            if cname is None:
+                continue
+            theta_log.setdefault(cname, []).append({
+                "round": r,
+                "stats": {
+                    "n_params": int(m.get("theta_n_params", 0)),
+                    "mean": float(m.get("theta_mean", 0.0)),
+                    "std": float(m.get("theta_std", 0.0)),
+                    "norm": float(m.get("theta_norm", 0.0)),
+                    "min": float(m.get("theta_min", 0.0)),
+                    "max": float(m.get("theta_max", 0.0)),
+                },
+            })
+
         return {"bytes_up": up, "bytes_down": down}
 
     def evaluate_fn(server_round, parameters, config):
@@ -291,6 +463,14 @@ def run_federated(
             return None
         theta = parameters if isinstance(parameters, list) \
             else [np.asarray(a) for a in parameters_to_ndarrays(parameters)]
+
+        # simpan theta global ronde ini (array mentah + statistik ringkas)
+        global_theta_per_round[server_round] = [p.copy() for p in theta]
+        history.setdefault("global_theta_stats", []).append({
+            "round": server_round,
+            "stats": summarize_theta(theta),
+        })
+
         loss, m, per_client = evaluate_personalized_per_client(
             theta, fed_data, common_dim, n_classes, local_dir, split="val")
         if m is None:
@@ -312,23 +492,19 @@ def run_federated(
     # parameter awal = theta saja (dimensi common_dim, sama untuk semua client)
     init_model = ClientModel(common_dim, common_dim, n_classes)  # n_features dummy
     init_params = ndarrays_to_parameters(get_theta_params(init_model))
-    def weighted_average(metrics):
-    # fit_metrics_aggregation_fn kamu yang sudah ada
-        total = sum(n for n, _ in metrics)
-        acc = sum(n * m.get("accuracy", 0.0) for n, m in metrics) / total
-        return {"accuracy": acc}
 
     def server_fn(context: Context) -> ServerAppComponents:
-        strategy =build_fedcosine_pairwise_strategy(
-    num_clients=num_clients,
-    init_params=init_params,
-    evaluate_fn=evaluate_fn,
-    fit_metrics_agg=weighted_average,
-    temperature=0.05,
-    min_weight=0.0,
-    similarity_agg="mean",          # atau "median"
-    combine_mode="similarity_only", # jumlah data diabaikan total
-)
+        strategy = build_fedcosine_pairwise_strategy(
+            num_clients=num_clients,
+            init_params=init_params,
+            evaluate_fn=evaluate_fn,
+            fit_metrics_agg=fit_metrics_agg,
+            temperature=context.run_config.get("temperature", 0.05),
+            min_weight=context.run_config.get("min-weight", 0.0),
+            similarity_agg=context.run_config.get("similarity-agg", "mean"),
+            log_csv=True,
+            csv_dir="./sim_csv",  # boleh relatif; folder dibuat otomatis kalau belum ada
+        )
         return ServerAppComponents(
             strategy=strategy, config=ServerConfig(num_rounds=num_rounds))
 
@@ -368,62 +544,8 @@ def run_federated(
           f"up={c['total_up_mb']:.2f}MB down={c['total_down_mb']:.2f}MB "
           f"total={c['total_mb']:.2f}MB (~{c['avg_per_round_mb']:.2f}MB/ronde)")
 
+    # simpan hasil tracking theta ke history
+    history["theta_log"] = theta_log
+    history["global_theta_per_round"] = global_theta_per_round
+
     return history
-
-def export_history_csv(history: Dict, out_path: str) -> str:
-    """
-    Ekspor metrik per-ronde (loss, accuracy, precision, recall, f1)
-    beserta bandwidth (bytes_up, bytes_down, bytes_total, cum_mb) ke CSV.
-    """
-    rounds = history.get("round", [])
-    n = len(rounds)
-    fieldnames = [
-        "round", "loss", "accuracy", "precision", "recall", "f1",
-        "bytes_up_MB", "bytes_down_MB", "bytes_total_MB", "cum_MB",
-    ]
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for i in range(n):
-            writer.writerow({
-                "round": history["round"][i],
-                "loss": history["loss"][i],
-                "accuracy": history["accuracy"][i],
-                "precision": history["precision"][i],
-                "recall": history["recall"][i],
-                "f1": history["f1"][i],
-                "bytes_up_MB": (history["bytes_up"][i] / MB
-                                if i < len(history["bytes_up"]) else ""),
-                "bytes_down_MB": (history["bytes_down"][i] / MB
-                                  if i < len(history["bytes_down"]) else ""),
-                "bytes_total_MB": (history["bytes_total"][i] / MB
-                                   if i < len(history["bytes_total"]) else ""),
-                "cum_MB": (history["cum_mb"][i]
-                           if i < len(history["cum_mb"]) else ""),
-            })
-    print(f"[export] metrik per-ronde tersimpan di: {out_path}")
-    return out_path
-
-
-def export_per_client_csv(history: Dict, out_path: str, split: str = "val_per_client") -> str:
-    """
-    Ekspor metrik per-client per-ronde (accuracy, precision, recall, f1)
-    ke CSV, berguna untuk melihat performa personalisasi tiap client.
-    """
-    rows = []
-    for r_idx, per_client in zip(history["round"], history.get(split, [])):
-        for cname, m in per_client.items():
-            rows.append({
-                "round": r_idx, "client": cname,
-                "accuracy": m["accuracy"], "precision": m["precision"],
-                "recall": m["recall"], "f1": m["f1"],
-            })
-    if not rows:
-        return ""
-    fieldnames = ["round", "client", "accuracy", "precision", "recall", "f1"]
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"[export] metrik per-client tersimpan di: {out_path}")
-    return out_path

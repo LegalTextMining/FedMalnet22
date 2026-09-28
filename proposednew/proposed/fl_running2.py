@@ -8,6 +8,7 @@ from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import numpy as np
+from sklearn import metrics
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -18,7 +19,6 @@ from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays, Context,
 from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.server.strategy import FedAvg
 from flwr.simulation import run_simulation
-
 from model import build_model
 
 DEVICE = torch.device("cpu")
@@ -234,8 +234,9 @@ class FlowerClient(NumPyClient):
         loss, m = evaluate_model(self.model, self.X, self.y)
         return loss, len(self.X), m
 
-
-from aggregation2 import build_fedcosine_pairwise_strategy
+import csv
+# from aggregation import build_fedavg_strategy
+from aggregationnew import build_fedcosine_pairwise_strategy
 
 # -----------------------------------------------------------------------------
 # Runner
@@ -311,16 +312,23 @@ def run_federated(
     # parameter awal = theta saja (dimensi common_dim, sama untuk semua client)
     init_model = ClientModel(common_dim, common_dim, n_classes)  # n_features dummy
     init_params = ndarrays_to_parameters(get_theta_params(init_model))
+    def weighted_average(metrics):
+    # fit_metrics_aggregation_fn kamu yang sudah ada
+        total = sum(n for n, _ in metrics)
+        acc = sum(n * m.get("accuracy", 0.0) for n, m in metrics) / total
+        return {"accuracy": acc}
 
     def server_fn(context: Context) -> ServerAppComponents:
         strategy = build_fedcosine_pairwise_strategy(
         num_clients=num_clients,
         init_params=init_params,
         evaluate_fn=evaluate_fn,
-        fit_metrics_agg=fit_metrics_agg,
+        fit_metrics_agg=weighted_average,
         temperature=0.05,
         min_weight=0.0,
-        similarity_agg="mean",
+        similarity_agg="mean",          # atau "median"
+        data_weight_influence=0.3,      # similarity tetap dominan
+        combine_mode="geometric",       # atau "linear"
     )
         return ServerAppComponents(
             strategy=strategy, config=ServerConfig(num_rounds=num_rounds))
@@ -362,3 +370,61 @@ def run_federated(
           f"total={c['total_mb']:.2f}MB (~{c['avg_per_round_mb']:.2f}MB/ronde)")
 
     return history
+
+def export_history_csv(history: Dict, out_path: str) -> str:
+    """
+    Ekspor metrik per-ronde (loss, accuracy, precision, recall, f1)
+    beserta bandwidth (bytes_up, bytes_down, bytes_total, cum_mb) ke CSV.
+    """
+    rounds = history.get("round", [])
+    n = len(rounds)
+    fieldnames = [
+        "round", "loss", "accuracy", "precision", "recall", "f1",
+        "bytes_up_MB", "bytes_down_MB", "bytes_total_MB", "cum_MB",
+    ]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for i in range(n):
+            writer.writerow({
+                "round": history["round"][i],
+                "loss": history["loss"][i],
+                "accuracy": history["accuracy"][i],
+                "precision": history["precision"][i],
+                "recall": history["recall"][i],
+                "f1": history["f1"][i],
+                "bytes_up_MB": (history["bytes_up"][i] / MB
+                                if i < len(history["bytes_up"]) else ""),
+                "bytes_down_MB": (history["bytes_down"][i] / MB
+                                  if i < len(history["bytes_down"]) else ""),
+                "bytes_total_MB": (history["bytes_total"][i] / MB
+                                   if i < len(history["bytes_total"]) else ""),
+                "cum_MB": (history["cum_mb"][i]
+                           if i < len(history["cum_mb"]) else ""),
+            })
+    print(f"[export] metrik per-ronde tersimpan di: {out_path}")
+    return out_path
+
+
+def export_per_client_csv(history: Dict, out_path: str, split: str = "val_per_client") -> str:
+    """
+    Ekspor metrik per-client per-ronde (accuracy, precision, recall, f1)
+    ke CSV, berguna untuk melihat performa personalisasi tiap client.
+    """
+    rows = []
+    for r_idx, per_client in zip(history["round"], history.get(split, [])):
+        for cname, m in per_client.items():
+            rows.append({
+                "round": r_idx, "client": cname,
+                "accuracy": m["accuracy"], "precision": m["precision"],
+                "recall": m["recall"], "f1": m["f1"],
+            })
+    if not rows:
+        return ""
+    fieldnames = ["round", "client", "accuracy", "precision", "recall", "f1"]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[export] metrik per-client tersimpan di: {out_path}")
+    return out_path
