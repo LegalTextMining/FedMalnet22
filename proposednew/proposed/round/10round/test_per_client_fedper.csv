@@ -1,0 +1,5 @@
+dataset,accuracy,precision,recall,f1
+drebin,0.961,0.9089,0.994,0.9495
+kronodroid,0.97,0.9883,0.9546,0.9712
+malgenome,0.9754,0.9581,0.9683,0.9632
+tuandromd,0.997,0.9981,0.9981,0.9981
